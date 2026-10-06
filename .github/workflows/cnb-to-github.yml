@@ -1,0 +1,131 @@
+name: cnb-to-github
+
+# 作用：把 CNB 侧 Horosa-Web-App 等仓库的改动自动推回 GitHub。
+#
+# 触发方式：定时轮询（每 10 分钟）+ 手动触发。
+# 为什么不用 push 触发：CNB 平台未提供 webhook API，
+# 无法在 CNB 收到 push 的瞬间通知 GitHub Actions。
+on:
+  # CNB 平台没有 webhook API，无法在 push瞬间通知 GitHub，
+  # 因此采用定时轮询。每 10 分钟一次，最大延迟 10 分钟。
+  # cron 刻意避开整点（用第 7,17,27,37,47,57 分），错开 GitHub Actions 高峰。
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:          # 需要立即同步时手动触发
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cnb-to-github-${{ github.repository }}
+  cancel-in-progress: false   # 不打断正在进行的同步，宁可排队
+
+env:
+  CNB_REPO: ${{ vars.CNB_REPO }}
+  CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+  CNB_OWNER: cnbnasa
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出 CNB 侧状态
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: 读取 CNB 与 GitHub 的 HEAD
+        id: heads
+        run: |
+          set -uo pipefail
+
+          REPO="${GITHUB_REPOSITORY#*/}"
+          echo "仓库: $REPO"
+
+          # CNB 侧 HEAD（public 仓库免密可读；private 需 CNB_TOKEN）
+          if [ -n "${CNB_TOKEN:-}" ]; then
+            CNB_HEAD=$(git ls-remote "https://cnb:$CNB_TOKEN@cnb.cool/${CNB_OWNER}/${REPO}.git" HEAD 2>/dev/null | awk '{print $1}')
+          else
+            CNB_HEAD=$(git ls-remote "https://cnb.cool/${CNB_OWNER}/${REPO}.git" HEAD 2>/dev/null | awk '{print $1}')
+          fi
+
+          GH_HEAD=$(git rev-parse HEAD)
+
+          echo "CNB_HEAD=${CNB_HEAD:-}" >> "$GITHUB_OUTPUT"
+          echo "GH_HEAD=${GH_HEAD}" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$CNB_HEAD" ]; then
+            echo "::error::无法读取 CNB 侧 HEAD，检查仓库名/凭据"
+            exit 1
+          fi
+
+          if [ "$CNB_HEAD" = "$GH_HEAD" ]; then
+            echo "两侧一致，无需同步"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "存在差异，准备同步"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 从 CNB 拉取并快进
+        if: steps.heads.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY#*/}"
+
+          if [ -n "${CNB_TOKEN:-}" ]; then
+            CNB_URL="https://cnb:$CNB_TOKEN@cnb.cool/${CNB_OWNER}/${REPO}.git"
+          else
+            CNB_URL="https://cnb.cool/${CNB_OWNER}/${REPO}.git"
+          fi
+
+          git remote add cnb "$CNB_URL"
+          git fetch --no-tags cnb "+refs/heads/main:refs/remotes/cnb/main"
+
+          # 只允许快进：CNB 侧必须是 GitHub 的后代，否则说明分叉了
+          if ! git merge-base --is-ancestor HEAD cnb/main; then
+            echo "::error::检测到分叉 —— CNB 侧不是 GitHub 的后代，拒绝自动合并"
+            BASE=$(git merge-base HEAD cnb/main 2>/dev/null || echo unknown)
+            echo ""
+            echo "| 项 | SHA |"
+            echo "|---|---|"
+            echo "| GitHub HEAD | \`$(git rev-parse HEAD)\` |"
+            echo "| CNB HEAD | \`$(git rev-parse cnb/main)\` |"
+            echo "| 共同祖先 | \`$BASE\` |"
+            echo ""
+            echo "常见成因：在 GitHub 侧直接提交了代码（未先同步到 CNB）。"
+            echo "处置：把 CNB 侧改动 pull 下来合并，而非直接 reset。"
+            exit 1
+          fi
+
+          git merge --ff-only cnb/main
+
+          # 同步配置和状态文件不入库（避免污染业务仓库）
+          git rm -q --cached .cnb.yml .cnb SYNC_STATUS.md 2>/dev/null || true
+          rm -rf .cnb SYNC_STATUS.md
+          git commit --amend --no-edit 2>/dev/null || true
+
+      - name: 推回 GitHub
+        if: steps.heads.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git push origin HEAD:main
+
+      - name: 汇报
+        if: always()
+        run: |
+          {
+            echo "## CNB → GitHub 同步"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 仓库 | \`${GITHUB_REPOSITORY}\` |"
+            echo "| CNB HEAD | \`${{ steps.heads.outputs.CNB_HEAD }}\` |"
+            echo "| GitHub HEAD | \`${{ steps.heads.outputs.GH_HEAD }}\` |"
+            echo "| 是否同步 | ${{ steps.heads.outputs.changed == 'true' && '是' || '否（已一致）' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

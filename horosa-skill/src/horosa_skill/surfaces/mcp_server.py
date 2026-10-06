@@ -1,0 +1,1526 @@
+from __future__ import annotations
+
+import functools
+
+import anyio
+
+import json
+import logging
+import os
+import re
+from inspect import Parameter, Signature
+from typing import Any, Literal
+
+from typing import Annotated
+
+from mcp import types as mcp_types
+from mcp.server.fastmcp import FastMCP
+from horosa_skill.surfaces.mcp_schema import apply_advertised_schemas
+from pydantic import BaseModel, Field, ValidationError, WithJsonSchema, create_model
+
+from horosa_skill.agent_guidance import (
+    build_agent_guidance,
+    build_technique_catalog,
+    technique_index,
+    build_tool_docstring,
+    build_validation_recovery,
+    validate_agent_preflight,
+)
+from horosa_skill import __version__
+from horosa_skill.config import Settings
+from horosa_skill.engine.registry import TOOL_DEFINITIONS
+from horosa_skill.errors import ToolValidationError, recovery_for
+from horosa_skill.schemas.common import ErrorInfo
+from horosa_skill.exports.registry import build_export_registry
+from horosa_skill.input_normalization import normalize_request_payload
+from horosa_skill.schemas.common import DispatchEnvelope, ToolEnvelope
+from horosa_skill.schemas.tools import (
+    AgentGuidanceInput,
+    DispatchInput,
+    HecanInput,
+    MemoryAnswerInput,
+    MemoryQueryInput,
+    MemoryShowInput,
+    ReportFromToolInput,
+    ReportRenderInput,
+    ReportTemplateInput,
+    TechniqueReportInput,
+)
+from horosa_skill.service import HorosaSkillService, progress_sink
+
+# 太极图 SVG（data URI，离线友好）：server 级图标，客户端渲染刚起步、成本近零先埋。
+_SERVER_ICON = mcp_types.Icon(
+    src=(
+        "data:image/svg+xml;utf8,"
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
+        "<circle cx='32' cy='32' r='30' fill='%23111827'/>"
+        "<path d='M32 2a30 30 0 000 60 15 15 0 010-30 15 15 0 000-30z' fill='%23f9fafb'/>"
+        "<circle cx='32' cy='17' r='5' fill='%23111827'/>"
+        "<circle cx='32' cy='47' r='5' fill='%23f9fafb'/></svg>"
+    ),
+    mimeType="image/svg+xml",
+    sizes=["64x64"],
+)
+
+# Tool annotations（MCP 2025-11-25）：客户端用它决定确认摩擦/自动放行；目录审核要求标注准确。
+# 判定口径（如实标注，见 AGENTS.md §4 / LESSONS）：
+# - 全部工具 openWorldHint=False（local-first：只打本机 runtime，不出网）。
+# - 查询类（registry/knowledge/guidance/memory 读、报告模板）readOnlyHint=True + idempotent=True。
+# - 技法计算类 readOnlyHint=False（默认会写一条本地 run 记录，memory_query 可见）、
+#   destructiveHint=False（只追加、不改不删）、idempotentHint=False（重复调用会追加新 run 行）。
+# - 报告渲染 readOnly=False + idempotent=True（同 run_id+format 原子覆盖同一产物）；
+#   report_from_tool 会重新起盘+新 run → idempotent=False。
+# - v0.40.0 P0：三个报告类工具会按 output_path **覆盖**磁盘文件（虽已限定在输出目录 / 白名单根内）→ destructiveHint=True，
+#   如实标注让客户端对它们保留确认摩擦；memory_record_answer 只追加记录，仍非 destructive。
+_ANN_QUERY = mcp_types.ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_ANN_CALC = mcp_types.ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
+_ANN_RENDER = mcp_types.ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_ANN_REPORT_WRITE = mcp_types.ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+)
+_ANN_REPORT_FROM_TOOL = mcp_types.ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
+
+_READONLY_TOOL_NAMES = {
+    "export_registry",
+    "export_parse",
+    "knowledge_registry",
+    "knowledge_read",
+    "ziwei_rules",
+    "gua_desc",
+    "gua_meiyi",
+    "astrodata",
+}
+
+
+def _tool_annotations(tool_name: str) -> mcp_types.ToolAnnotations:
+    if tool_name in _READONLY_TOOL_NAMES:
+        return _ANN_QUERY
+    return _ANN_CALC
+
+
+# 入口型工具：即使客户端把 MCP 工具全部 deferred（Claude Code 的工具搜索默认行为），这几个也常驻，
+# 保证模型永远看得见「怎么问路」和「有哪些技法」。键名是 Claude Code 侧的 _meta 约定。
+_ALWAYS_LOAD_TOOLS = {"horosa_agent_guidance", "horosa_dispatch", "horosa_tool_run"}
+_ALWAYS_LOAD_META = {"anthropic/alwaysLoad": True}
+
+
+def _tool_meta(mcp_name: str) -> dict[str, Any] | None:
+    return dict(_ALWAYS_LOAD_META) if mcp_name in _ALWAYS_LOAD_TOOLS else None
+
+
+def _structured_output_enabled() -> bool:
+    """是否给工具声明 `outputSchema`（→ 客户端拿到 `structuredContent`）。**默认关**。
+
+    规范鼓励它，但 Claude Code 有过 anthropics/claude-code#25081：服务器带 outputSchema 时**整个
+    工具列表静默消失**——该 issue 至今 stale-closed、未确认修复。工具全体消失对本产品是灾难级故障，
+    而收益只是「结构化副本」（正文 JSON 一直都在 content 里）。因此默认不开，`HOROSA_OUTPUT_SCHEMA=1`
+    给已在自己客户端验证过 `/mcp` 工具计数不掉的用户使用。
+    """
+    return os.environ.get("HOROSA_OUTPUT_SCHEMA", "0").strip().lower() in {"1", "true", "on"}
+
+
+def _return_type(annotation: Any) -> Any:
+    return annotation if _structured_output_enabled() else Signature.empty
+
+
+def _selected_toolsets() -> set[str] | None:
+    """`HOROSA_TOOLSETS=astro,cn` → 只平铺这些 domain 的技法工具（门面工具永远注册）。
+
+    动机：Claude Code 已用工具搜索解决了全量技法工具的上下文膨胀，但 Cursor 一类客户端仍有较紧的工具数
+    上限，全量平铺会被静默截断。分组白名单是注册期过滤，不触碰 service 层。
+    `HOROSA_TOOLSETS=none` == 精简模式（等价 HOROSA_MCP_COMPACT=1 的技法面）。
+    """
+    return _resolve_toolsets(os.environ.get("HOROSA_TOOLSETS", ""))["effective"]
+
+
+# HOROSA_TOOLSETS 合法域 + 别名（v0.36.0 B2：此前拼错一个 token = 零技法且无 tool_run 直呼，客户端只剩门面）。
+# 🔴 从注册表派生，不手抄：手抄那份漏了 `export` 与 `knowledge` 两个域，于是 5 个工具
+# （export_registry / export_parse / knowledge_registry / knowledge_read / knowledge_xuanshi）
+# 经**任何** HOROSA_TOOLSETS 取值都到不了，而 `all` 只给 112 个而非 116 ——「all」不是 all。
+# 未知 token 的告警路径也永远不会为它们触发（它们是**合法**域，只是不在白名单里）。
+_TOOLSET_DOMAINS: frozenset[str] = frozenset(
+    str(definition.domain).lower() for definition in TOOL_DEFINITIONS.values()
+)
+_TOOLSET_ALIASES: dict[str, frozenset[str]] = {
+    "western": frozenset({"astro", "predict", "chart"}),
+    "chinese": frozenset({"cn", "shenshu"}),
+    "reference": frozenset({"export", "knowledge"}),
+    "all": _TOOLSET_DOMAINS,
+    "none": frozenset(),
+}
+
+
+def _resolve_toolsets(raw: str) -> dict[str, Any]:
+    """`HOROSA_TOOLSETS` 文本 → {requested, effective(set|None), unknown}；未知 token 告警丢弃，全空回落全量。"""
+    tokens = [part.strip().lower() for part in f"{raw or ''}".split(",") if part.strip()]
+    if not tokens:
+        return {"requested": [], "effective": None, "unknown": []}
+    effective: set[str] = set()
+    unknown: list[str] = []
+    saw_none = False
+    for token in tokens:
+        if token in _TOOLSET_ALIASES:
+            effective |= _TOOLSET_ALIASES[token]
+            saw_none = saw_none or token == "none"
+        elif token in _TOOLSET_DOMAINS:
+            effective.add(token)
+        else:
+            unknown.append(token)
+    if unknown:
+        # 启动期配置通知，无工具调用可告知——不是降级点（verify_silent_degrades 只盯 logger.warning）。
+        logger.log(
+            logging.WARNING,
+            "HOROSA_TOOLSETS 含未知 token %s（合法：%s + 别名 %s）——已忽略；%s",
+            unknown, sorted(_TOOLSET_DOMAINS), sorted(_TOOLSET_ALIASES),
+            "回落全量平铺" if not effective and not saw_none else "只平铺已识别的域",
+        )
+    if not effective and not saw_none:
+        return {"requested": tokens, "effective": None, "unknown": unknown}
+    return {"requested": tokens, "effective": effective, "unknown": unknown}
+
+
+def _server_profile(settings: Settings) -> dict[str, Any]:
+    """本进程实际暴露了什么（经 horosa_agent_guidance 可查；_SERVER_INSTRUCTIONS 没预算放它）。"""
+    resolved = _resolve_toolsets(os.environ.get("HOROSA_TOOLSETS", ""))
+    effective = resolved["effective"]
+    compact = bool(settings.mcp_compact)
+    registered = (
+        0 if compact else sum(1 for d in TOOL_DEFINITIONS.values() if effective is None or d.domain.lower() in effective)
+    )
+    return {
+        "compact": compact,
+        "toolsets_requested": resolved["requested"],
+        "toolsets_effective": None if effective is None else sorted(effective),
+        "toolsets_unknown": resolved["unknown"],
+        "technique_tools_registered": registered,
+        "tool_run_registered": compact or effective is not None,
+        "hint": "技法工具未平铺时用 horosa_tool_run(tool_name=…) 直呼；HOROSA_TOOLSETS 合法域见 toolsets_effective。",
+    }
+
+
+# Server instructions：客户端把它当「这台服务器是干什么的」说明书常驻上下文。自 Claude Code 起
+# 门面工具数（非技法工具：dispatch / guidance / tool_run / memory×3 / report×2 / export×… 等）。
+# 🔴 计数单一真值：以前 marketplace 说 97、instructions 说 106、字节契约说 115、实际 116 —— 四处
+# 互不相同且都「有人守」。默认平铺面 = FACADE_TOOL_COUNT + len(TOOL_DEFINITIONS)，任何文案都从这里算。
+FACADE_TOOL_COUNT = 10
+
+# 精简面工具数 = 10 门面 + horosa_tool_run。README×2 的「11 个门面/11 facades」由 verify_docs_sync 锁步到此常量。
+COMPACT_SURFACE_TOOL_COUNT = FACADE_TOOL_COUNT + 1
+
+
+# MCP 工具默认 deferred（工具搜索按需加载），instructions 就成了模型决定「要不要来搜我」的唯一依据
+# ——它的作用更接近一份 skill 而非一句简介。上限约 2KB，超出截断，故关键信息前置。
+_SERVER_INSTRUCTIONS = f"""Horosa (星阙) — local-first 术数/占星 computation. All engines run on this
+machine (offline); nothing is sent to a remote service.
+
+WHEN TO REACH FOR THIS SERVER
+Any request to 起盘/排盘/起课/起卦/算命/看运势/合盘/择日/卜卦, or to explain, store, or report
+such a chart. Also 农历/节气/黄历 conversion and celebrity birth data.
+
+WHAT IT COVERS ({FACADE_TOOL_COUNT + len(TOOL_DEFINITIONS)} tools)
+· Western: natal + derived charts, 20+ predictive systems (returns, progressions, primary
+  directions, zodiacal releasing, firdaria), horary 卜卦, astrocartography, midpoints.
+· Chinese: 八字, 紫微斗数, 大六壬, 奇门遁甲, 太乙, 金口诀, 三式合一, 六爻, 河洛理数,
+  邵子参评数, 一掌经, 小六壬, 飞宫小奇门, 小成图, 皇极轨策, 统摄法, 宿占, 灵棋经.
+· 择日 ×10: condition-tree window search (天星/奇门/黄历/八字/太乙/紫微/六壬/三式/七政/印度).
+· 神数 ×14 + 神数正传 (5 schools), 天文地占, tarot.
+
+HOW TO USE IT
+1. Unsure? horosa_agent_guidance / horosa_dispatch. horosa_hecan runs several techniques on one
+   question → cross-validation (divergence disclosed, never averaged).
+2. A tool REFUSES (agent_guidance.required) when a result-changing setting is missing — time, place,
+   timezone, gender, 流派/宫制/起局方式. Ask via details.agent_recovery.prompt_to_user, then retry with
+   agent_confirmed_settings=true (or defaults_accepted=true). Never self-confirm.
+3. Explain ONLY from the returned export_snapshot.export_text sections — never hand-calculate, and
+   never read a missing section as a missing dependency.
+4. Every result carries data.technique_card (technique, settings, engine) — quote it after your
+   answer; horosa_technique_report renders it per run/session.
+5. Runs are stored: horosa_memory_query finds them; horosa_report_render writes DOCX/PDF.
+
+HOROSA_MCP_COMPACT=1 exposes {COMPACT_SURFACE_TOOL_COUNT} facade tools instead of {FACADE_TOOL_COUNT + len(TOOL_DEFINITIONS)} (horosa_tool_run reaches any technique
+by name); HOROSA_TOOLSETS=astro,cn limits which groups are exposed."""
+
+# HOROSA_JEV 开启时的 instructions（v0.39.0）：「nothing is sent to a remote service」这句在决策层开着时
+# 是假话，必须改口；预算仍是 2048 字节，所以同一变体里裁掉两句次要说明来换空间（两态都由测试锁 ≤2048）。
+_OFFLINE_CLAIM = "machine (offline); nothing is sent to a remote service."
+_JEV_CLAIM = (
+    "machine (offline). HOROSA_JEV is ON: redacted request text is sent to TypeSafe Jev (cloud)\n"
+    "for routing/clarification; results self-report it in technique_card.decisions."
+)
+_JEV_TRIMS = (
+    ("\nsuch a chart. Also 农历/节气/黄历 conversion and celebrity birth data.", "\nsuch a chart, 农历/节气/黄历 conversion, celebrity birth data."),
+    (
+        "· Western: natal + derived charts, 20+ predictive systems (returns, progressions, primary\n  directions, zodiacal releasing, firdaria), horary 卜卦, astrocartography, midpoints.",
+        "· Western: natal + derived charts, 20+ predictive systems, horary 卜卦, astrocartography, midpoints.",
+    ),
+    ("· 神数 ×14 + 神数正传 (5 schools), 天文地占, tarot.", "· 神数 ×14 + 神数正传, 天文地占, tarot."),
+    ("   question → cross-validation (divergence disclosed, never averaged).", "   question → cross-validation (divergence disclosed)."),
+)
+
+
+def _server_instructions(*, decision_layer_on: bool) -> str:
+    if not decision_layer_on:
+        return _SERVER_INSTRUCTIONS
+    text = _SERVER_INSTRUCTIONS.replace(_OFFLINE_CLAIM, _JEV_CLAIM)
+    for old, new in _JEV_TRIMS:
+        text = text.replace(old, new)
+    return text
+
+
+_TITLE_TAIL_PAREN = re.compile(r"[（(][^（()）]*[)）]\s*$")
+
+
+def _tool_title(tool_name: str) -> str | None:
+    """人类可读的工具标题（客户端工具选择器显示它，而不是 `horosa_cn_xiaochengtu` 这种 raw id）。
+
+    工具描述是「中文首句（补充）。English sentence.」的双语形态（registry.py），取中文首句、去掉
+    结尾括注即得一个准确的技法名——中文技法名是本产品最大的可读性资产，不该丢在 raw id 后面。
+    """
+    definition = TOOL_DEFINITIONS.get(tool_name)
+    if definition is None:
+        return None
+    head = str(definition.description or "").split("。", 1)[0].strip()
+    if not head:
+        return None
+    head = _TITLE_TAIL_PAREN.sub("", head).strip()
+    if not head or head.isascii():  # 纯英文描述 → 交回 FastMCP 默认（用 name）
+        return None
+    return head[:24]
+
+
+def _normalize_mcp_request(raw_request: Any, model: type[BaseModel]) -> dict[str, Any]:
+    payload = raw_request
+    if isinstance(payload, BaseModel):
+        payload = payload.model_dump(exclude_none=True)
+
+    if payload is None:
+        payload = {}
+
+    if isinstance(payload, str):
+        text = payload.strip()
+        try:
+            payload = {} if not text else json.loads(text)
+        except json.JSONDecodeError as exc:
+            # 🔴 这两条以前抛 JSONDecodeError / ValueError，而它们发生在**每个工具的 try 之前** ——
+            # lowlevel server 把裸异常转成 `isError: true` + 原始字符串，绕过整个 agent_recovery 契约。
+            # 影响面是全部 116 个工具：任何把参数字符串化的客户端（Gemini CLI、旧版 Cursor、
+            # n8n/Dify 的模板渲染）传坏一次 JSON，拿到的就是一条模型无从恢复的裸报错。
+            raise ToolValidationError(
+                "request 不是合法的 JSON 对象字符串。",
+                code="tool.invalid_payload",
+                details={
+                    "request_preview": text[:120],
+                    "json_error": str(exc),
+                    "next_action": "把参数按 inputSchema 直接作为对象传；确需整包时 request 必须是合法 JSON 对象。",
+                },
+            ) from exc
+
+    if not isinstance(payload, dict):
+        raise ToolValidationError(
+            "request 必须是对象或 JSON 对象字符串。",
+            code="tool.invalid_payload",
+            details={
+                "received_type": type(payload).__name__,
+                "next_action": "把参数按 inputSchema 直接作为对象传。",
+            },
+        )
+
+    payload = normalize_request_payload(payload)
+    normalized = model.model_validate(payload)
+    return normalized.model_dump(exclude_none=True)
+
+
+# 输入归一化能吸收的字段：`input_normalization.normalize_request_payload` 会把这些键的数字/别名
+# 形态转成引擎要的字符串（如 lat=39.9 → "39n54"）。但 FastMCP 在**进入函数体之前**就按 arg model
+# 校验，纯 `"string"` 的广告类型会让 `{"lat": 39.9}`（模型极高频输出）在归一化之前就被拒，回一条裸
+# pydantic 错误，绕过整套 agent_recovery 契约。故对这些键放宽广告类型。
+_NUMERIC_TOLERANT_FIELDS = frozenset(
+    {"lat", "lon", "dirLat", "dirLon", "gpsLat", "gpsLon", "zone", "dirZone", "gender", "date", "time", "datetime"}
+)
+
+
+def _inline_refs(node: Any, defs: dict[str, Any], seen: frozenset[str] = frozenset(), depth: int = 0) -> Any:
+    """把 `#/$defs/X` 就地展开——单个 property 会被摘出来独立广告，`$ref` 在那里解析不到根。
+
+    **不变量：返回值里绝不残留 `$ref`。** 模型之间存在自引用（如嵌套 BirthInput），一旦把带 `$ref`
+    的片段塞进 `WithJsonSchema`，pydantic 生成 arg model 时会 `KeyError: '#/$defs/…'` 而整个服务器
+    起不来。故遇环 / 超深 / 目标缺失时一律降级为「无约束对象」，宁可广告得宽松也不能构不出来。
+    """
+    if not isinstance(node, (dict, list)):
+        return node
+    if isinstance(node, list):
+        return [_inline_refs(item, defs, seen, depth + 1) for item in node]
+
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        name = ref.split("/")[-1]
+        target = defs.get(name) if ref.startswith("#/$defs/") else None
+        rest = {key: value for key, value in node.items() if key != "$ref"}
+        if not isinstance(target, dict) or name in seen or depth > 6:
+            return {**({"type": "object"} if not rest else {}), **rest}
+        return {
+            **_inline_refs(target, defs, seen | {name}, depth + 1),
+            **{key: _inline_refs(value, defs, seen, depth + 1) for key, value in rest.items()},
+        }
+    return {key: _inline_refs(value, defs, seen, depth + 1) for key, value in node.items()}
+
+
+def _widen(field_name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    if field_name not in _NUMERIC_TOLERANT_FIELDS:
+        return schema
+    widened = dict(schema)
+    declared = widened.get("type")
+    if declared == "string":
+        widened["type"] = ["string", "number"]
+    if declared is None and "anyOf" in widened:
+        # 🔴 以前这里是一句表达式语句 `widened.pop("anyOf", None) if … else None`：它把唯一的类型
+        # 信息摘掉却不补回去。pydantic 给 `float | None` 的形状是 anyOf:[{number},{null}]，pop 完
+        # 只剩 {"title": "Gpslat"}，再经 _own_property 的键白名单过滤后就是**空对象 {}**。
+        # 实测 70 个属性（gpsLat/gpsLon×26、datetime/dirZone×6、dirLat/dirLon×3 …）广告成 {}，
+        # 而 Gemini/Vertex 的 FunctionDeclaration 与 OpenAI strict 都要求每个属性有 type ——
+        # 它们拒的不是这一个字段，是**整张工具表**。
+        members = {
+            str(entry.get("type"))
+            for entry in widened.get("anyOf", [])
+            if isinstance(entry, dict) and entry.get("type") and entry.get("type") != "null"
+        }
+        widened.pop("anyOf", None)
+        # 这批字段的引擎口径都能吃字符串（normalize_request_payload 会把 "31.22" 归一成 "31n13"），
+        # 所以多类型时统一广告成 string，是**无损**的收窄。
+        widened["type"] = "string" if len(members) != 1 else members.pop()
+    return widened
+
+
+def _signature_for_input_model(model: type[BaseModel], *, return_type: Any = Signature.empty) -> Signature:
+    """Build the advertised MCP signature: **faithful schema, loose validation**.
+
+    FastMCP registers tools with `validate_input=False`, so the advertised inputSchema and the actual
+    validation are decoupled — the real validation is the pydantic model inside the function body, which
+    runs *after* `normalize_request_payload`. We exploit that: every parameter is optional with a
+    permissive annotation (so nothing is rejected before normalization, and the documented `request={…}`
+    escape hatch actually works), while the per-field JSON schema — description, enum, required-ness as
+    a `[required]` marker — is still advertised verbatim so the model sees the real contract.
+    """
+    json_schema = model.model_json_schema()
+    defs = json_schema.get("$defs", {})
+    properties = json_schema.get("properties", {})
+    required = set(json_schema.get("required", []))
+
+    parameters: list[Parameter] = [
+        Parameter(
+            "request",
+            kind=Parameter.KEYWORD_ONLY,
+            default=None,
+            annotation=Annotated[
+                Any,
+                WithJsonSchema(
+                    {
+                        "type": ["object", "string"],
+                        "description": (
+                            "Escape hatch: pass the whole payload as one object (or a JSON string). "
+                            "Required for any field not declared below."
+                        ),
+                    }
+                ),
+            ],
+        )
+    ]
+
+    for field_name in model.model_fields:
+        field_schema = _inline_refs(properties.get(field_name, {}), defs)
+        if not isinstance(field_schema, dict):
+            field_schema = {}
+        field_schema = _widen(field_name, dict(field_schema))
+        field_schema.pop("default", None)
+        if field_name in required:
+            description = str(field_schema.get("description") or "").strip()
+            field_schema["description"] = f"[required] {description}".strip()
+            field_schema["x-horosa-required"] = True
+        parameters.append(
+            Parameter(
+                field_name,
+                kind=Parameter.KEYWORD_ONLY,
+                default=None,
+                annotation=Annotated[Any, WithJsonSchema(field_schema)],
+            )
+        )
+
+    return Signature(parameters=parameters, return_annotation=return_type)
+
+
+def _merge_mcp_arguments(kwargs: dict[str, Any]) -> dict[str, Any] | str | None:
+    request = kwargs.pop("request", None)
+    if request is not None:
+        return request
+    # 每个参数现在都以 None 为默认值出现在 kwargs 里；把它们喂进 extra="allow" 的模型会凭空造出
+    # 几十个 None 字段，也会让澄清闸误判「用户已提供该设置」。未显式给出的一律剔除。
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
+# `horosa_tool_run` 的公共字段：覆盖绝大多数技法的起盘输入 + 闸门确认位。
+# 其余技法专属字段走 `request`（arg model 是 extra=ignore，未声明的顶层键会被静默吞）。
+_TOOL_RUN_COMMON_FIELDS: tuple[tuple[str, Any, str], ...] = (
+    ("date", str | None, "公历日期 YYYY-MM-DD"),
+    ("time", str | None, "HH:mm:ss"),
+    ("zone", str | None, "时区偏移，如 +08:00"),
+    ("lat", str | float | None, "纬度 31n13 / 31.22"),
+    ("lon", str | float | None, "经度 121e28 / 121.47"),
+    ("gpsLat", float | None, "十进制纬度"),
+    ("gpsLon", float | None, "十进制经度"),
+    ("ad", int | None, "纪元 1=公元后 -1=公元前"),
+    ("gender", str | int | None, "性别 1/男 0/女"),
+    ("name", str | None, "当事人姓名"),
+    ("pos", str | None, "地点名"),
+    ("datetime", str | None, "推运目标时刻"),
+    ("dirZone", str | None, "推运目标地时区"),
+    ("dirLat", str | float | None, "推运目标地纬度"),
+    ("dirLon", str | float | None, "推运目标地经度"),
+    ("question", str | None, "所问事项"),
+    ("response_view", str | None, "响应裁剪 titles|sections"),
+    ("agent_confirmed_settings", bool | None, "用户已确认设置→true"),
+    ("defaults_accepted", bool | None, "用户接受默认→true"),
+    ("clarification_notes", str | None, "确认摘要"),
+)
+
+
+def _tool_run_signature(*, return_type: Any = Signature.empty) -> Signature:
+    parameters = [
+        Parameter("tool_name", kind=Parameter.KEYWORD_ONLY, default=None, annotation=str | None),
+        Parameter(
+            "request",
+            kind=Parameter.KEYWORD_ONLY,
+            default=None,
+            annotation=dict[str, Any] | str | None,
+        ),
+    ]
+    parameters.extend(
+        Parameter(field_name, kind=Parameter.KEYWORD_ONLY, default=None, annotation=annotation)
+        for field_name, annotation, _doc in _TOOL_RUN_COMMON_FIELDS
+    )
+    return Signature(parameters=parameters)
+
+
+def _validation_error(operation_name: str, tool_name: str | None, exc: ValidationError) -> ToolValidationError:
+    """pydantic 校验失败 → 与闸门同形的、可直接转问用户的结构化错误。"""
+    errors = [
+        {"loc": list(err.get("loc", [])), "msg": err.get("msg"), "type": err.get("type")}
+        for err in exc.errors(include_url=False)
+    ]
+    recovery = build_validation_recovery(operation_name=operation_name, errors=errors, tool_name=tool_name)
+    return ToolValidationError(
+        f"{operation_name} payload failed validation; see details.agent_recovery.",
+        code="tool.invalid_payload",
+        details={"validation_errors": errors, "agent_recovery": recovery},
+    )
+
+
+def _mcp_error_envelope(exc: ToolValidationError, *, tool_name: str) -> ToolEnvelope:
+    """错误也返回一个合规 ToolEnvelope（顶层 code/message/details 镜像保持向后兼容）。
+
+    技法工具/dispatch/tool_run 的返回类型是信封；错误路径若返回裸 dict，一旦声明 outputSchema，
+    server 与 client 两侧的出参校验都会失败并被包成协议级 ToolError——整个澄清闸会当场报废。
+    """
+    details = recovery_for(exc.code, exc.details)  # MCP 面与 run_tool 同一套恢复码表（v0.36.0 B4）
+    return ToolEnvelope(
+        ok=False,
+        tool=tool_name,
+        version=__version__,
+        input_normalized={},
+        error=ErrorInfo(code=exc.code, message=str(exc), details=details),
+        code=exc.code,
+        message=str(exc),
+        details=details,
+    )
+
+
+def _gate_to_envelope(error: dict[str, Any], *, tool_name: str) -> ToolEnvelope:
+    """闸门/恢复类错误 dict → 合规 ToolEnvelope（顶层 code/message/details 原样镜像）。
+
+    闸门是最常见的首次返回；它若不合返回类型，声明 outputSchema 后会被两侧出参校验打成协议级
+    ToolError，澄清闸直接报废。转换保证「错误也是信封」，同时不动 details.agent_recovery 的内容。
+    """
+    details = dict(error.get("details") or {})
+    code = str(error.get("code") or "tool.error")
+    message = str(error.get("message") or "")
+    return ToolEnvelope(
+        ok=False,
+        tool=tool_name,
+        version=__version__,
+        input_normalized={},
+        error=ErrorInfo(code=code, message=message, details=details),
+        code=code,
+        message=message,
+        details=details,
+    )
+
+
+def _gate_to_dispatch_envelope(error: dict[str, Any]) -> DispatchEnvelope:
+    details = dict(error.get("details") or {})
+    code = str(error.get("code") or "tool.error")
+    message = str(error.get("message") or "")
+    return DispatchEnvelope(
+        ok=False,
+        version=__version__,
+        error=ErrorInfo(code=code, message=message, details=details),
+        code=code,
+        message=message,
+        details=details,
+    )
+
+
+# 工作线程并发上限：每个在跑的工具会持有一个 JS 子进程或一条后端 HTTP 连接，无限并发会
+# 把本机 CPU 与后端连接池打满。4 是「几个客户端同时问一句」的常见峰值。
+_MAX_CONCURRENT_TOOLS = max(1, int(os.environ.get("HOROSA_MCP_MAX_CONCURRENT_TOOLS", "4") or 4))
+_TOOL_LIMITER: Any = None
+
+
+def _tool_limiter() -> Any:
+    """并发上限。必须在事件循环里惰性构造（CapacityLimiter 绑定当前 async 后端）。"""
+    global _TOOL_LIMITER
+    if _TOOL_LIMITER is None:
+        _TOOL_LIMITER = anyio.CapacityLimiter(_MAX_CONCURRENT_TOOLS)
+    return _TOOL_LIMITER
+
+
+async def _run_blocking(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """把同步的 service 调用挪到工作线程。
+
+    🔴 每个工具都是 `async def` 却直接调同步的 `service.run_tool`（内含阻塞 httpx 与
+    subprocess.run），而 FastMCP 1.x 不会替我们卸载（func_metadata: `if fn_is_async: await fn()
+    else: fn()`）。后果是**整个事件循环被占住**：一次 tianxing 731 天扫描（约 24 段串行后端调用）
+    期间服务器答不了 ping、处理不了 notifications/cancelled，streamable-HTTP 下所有客户端串行。
+    Claude Desktop / VS Code 会把它标成无响应。
+
+    anyio 4.13 的 to_thread 会 `copy_context()`，所以 `_DEGRADE_NOTES` 这类 ContextVar
+    与 lowlevel 的 request_ctx 在工作线程里都可见 —— 这是这个改法成立的前提，已核实。
+    """
+    return await anyio.to_thread.run_sync(
+        functools.partial(fn, *args, **kwargs), limiter=_tool_limiter(), abandon_on_cancel=True
+    )
+
+
+def _progress_tick_for(mcp: FastMCP) -> Any:
+    """构造交给服务层的 tick 回调（工作线程里被调用）。取不到请求上下文时返回 None。
+
+    两件事，顺序不可换：
+      1. `check_cancelled()` —— 客户端发了 notifications/cancelled 后，工作线程在**下一个段边界**
+         抛 CancelledError（BaseException，穿过服务层的 `except Exception` 旁路兜底）。没有它，
+         撤单只是让宿主任务提前返回，工作线程照样把剩下的几十次后端扫描跑完，白烧后端与本机。
+      2. `ctx.report_progress` —— 客户端没给 progressToken 时 SDK 自身 no-op，无需在这里判断。
+    """
+    try:
+        ctx = mcp.get_context()
+    except Exception:  # noqa: BLE001 - 不在请求上下文里（直调/测试）时安静降级为无进度
+        return None
+
+    def _tick(done: int, total: int, label: str) -> None:
+        anyio.from_thread.check_cancelled()
+        anyio.from_thread.run(ctx.report_progress, float(done), float(total), label)
+
+    return _tick
+
+
+async def _run_tool_blocking(mcp: FastMCP, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """`_run_blocking` + 把 MCP 进度/取消接到服务层的分段循环上。"""
+    tick = _progress_tick_for(mcp)
+    if tick is None:
+        return await _run_blocking(fn, *args, **kwargs)
+    # ContextVar 在**事件循环侧**设好，to_thread 的 copy_context 才会把它带进工作线程。
+    with progress_sink(tick):
+        return await _run_blocking(fn, *args, **kwargs)
+
+
+async def _guarded_facade(
+    mcp: FastMCP, operation_name: str, fn: Any, *args: Any, **kwargs: Any
+) -> dict[str, Any]:
+    """门面工具的统一异常护栏 **兼**线程卸载入口。
+
+    🔴 门面此前各写各的（`horosa_agent_guidance` 干脆没有 try，memory 族只 catch
+    ToolValidationError）。漏网的异常会被 lowlevel server 转成 `isError: true` + 裸字符串，
+    绕过整个 agent_recovery 契约 —— 而在精简面（HOROSA_MCP_COMPACT=1）下门面**就是**全部工具，
+    所以这条漏洞在最省 token 的那个配置里覆盖面最大。三分支与技法工具逐字同款。
+
+    fn 在工作线程里跑（`_run_blocking`）：门面同样会做磁盘 I/O（报告渲染、SQLite 查询）与后端
+    HTTP 调用，留在事件循环上会让 ping/cancel/其他工具全部排队。归一化也放进线程，这样
+    `_normalize_mcp_request` 抛的 ToolValidationError 一样落进本护栏，而不是从工具体外逃逸。
+    """
+    try:
+        return await _run_tool_blocking(mcp, fn, *args, **kwargs)
+    except ToolValidationError as exc:
+        return _mcp_error_payload(exc)
+    except ValidationError as exc:
+        return _mcp_validation_error_payload(operation_name, None, exc)
+    except Exception as exc:  # noqa: BLE001 - 兜底也必须是 envelope，不能变 isError 裸文本
+        return _mcp_internal_error_payload(exc)
+
+
+def _mcp_error_payload(exc: ToolValidationError) -> dict[str, Any]:
+    details = recovery_for(exc.code, exc.details)
+    return {
+        "ok": False,
+        "code": exc.code,
+        "message": str(exc),
+        "details": details,
+        "error": {
+            "code": exc.code,
+            "message": str(exc),
+            "details": details,
+        },
+    }
+
+
+def _mcp_internal_error_payload(exc: Exception) -> dict[str, Any]:
+    # Last-resort structured error so an unexpected failure (e.g. a DOCX/PDF renderer or disk
+    # I/O error during report generation) returns cleanly instead of breaking the MCP session.
+    message = str(exc) or exc.__class__.__name__
+    details = {"exception_type": type(exc).__name__}
+    return {
+        "ok": False,
+        "code": "tool.internal_error",
+        "message": message,
+        "details": details,
+        "error": {"code": "tool.internal_error", "message": message, "details": details},
+    }
+
+
+def _mcp_validation_error_payload(operation_name: str, tool_name: str | None, exc: ValidationError) -> dict[str, Any]:
+    # 已确认但载荷畸形（类型错/字段形状错）→ 与闸门同形的「可转问用户」恢复契约，
+    # 而不是让 pydantic 文本裸奔（agent_guidance.build_validation_recovery 是同一套机读结构）。
+    errors = [
+        {"loc": list(err.get("loc", [])), "msg": err.get("msg"), "type": err.get("type")}
+        for err in exc.errors(include_url=False)
+    ]
+    recovery = build_validation_recovery(operation_name=operation_name, errors=errors, tool_name=tool_name)
+    details = {"validation_errors": errors, "agent_recovery": recovery}
+    message = f"{operation_name} payload failed validation; see details.agent_recovery."
+    return {
+        "ok": False,
+        "code": "tool.invalid_payload",
+        "message": message,
+        "details": details,
+        "error": {"code": "tool.invalid_payload", "message": message, "details": details},
+    }
+
+
+def _agent_preflight_error(tool_name: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    preflight = validate_agent_preflight(tool_name, payload)
+    if preflight.get("ok"):
+        return None
+    return _mcp_error_payload(ToolValidationError(preflight["message"], code=preflight["code"], details=preflight))
+
+
+# ---------------------------------------------------------------------------
+# MCP elicitation（双轨澄清闸）
+#
+# 客户端声明 elicitation 能力（Claude Code ≥2.1.76 / Cursor / VS Code）时，闸门拦截不再只回
+# 结构化错误，而是先用原生表单问一次用户：
+#   - 「按星阙默认继续」→ 直接以 defaults_accepted=true 重跑（最常见的快路径一跳闭环）；
+#   - 「我在对话里补充设置」/取消 → 回落到既有 agent_guidance.required 错误往返（agent 照
+#     SKILL.md 在聊天里追问并自行构造载荷——表单答案只进 clarification_notes，绝不静默替用户
+#     选具体术数参数）。
+# 不支持 elicitation 的客户端（Claude Desktop / Codex / Open WebUI / OpenClaw / CLI）行为与
+# 从前逐字节一致。HOROSA_MCP_ELICIT=0 可整体关闭。任何异常都吞掉并回落——elicitation 永远
+# 只能是增强，不能成为新的失败点。
+# ---------------------------------------------------------------------------
+
+
+_ELICIT_DEFAULTS = "按星阙默认继续 (use Xingque defaults)"
+_ELICIT_PROVIDE = "我在对话里补充设置 (I will provide settings in chat)"
+_ELICIT_CANCEL = "取消 (cancel)"
+
+
+logger = logging.getLogger(__name__)
+
+
+def _elicitation_enabled() -> bool:
+    return os.environ.get("HOROSA_MCP_ELICIT", "1").strip().lower() not in {"0", "false", "off"}
+
+
+def _elicit_timeout_seconds() -> float:
+    """`elicitation/create` 的等待预算（秒），0 或负数 = 不设超时。
+
+    🔴 `ctx.elicit()` 本身**没有超时**：客户端声明了 elicitation 能力却把表单丢给一个已经走开的
+    用户（或干脆不回应答），这次 tools/call 就永远挂着——占着一个并发名额、一个 JS 子进程配额，
+    而调用方那头只看到工具无响应。120 秒够真人读完并回答一张确认表，也远短于各家客户端自己的
+    工具超时（Codex 默认 60 秒、Cursor/VS Code 各有默认），所以超时后我们还来得及把**结构化闸门**
+    交回去，让 agent 走「问用户」的常规路径，而不是把整个会话拖死。
+    """
+    raw = os.environ.get("HOROSA_MCP_ELICIT_TIMEOUT_SECONDS", "120").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 120.0
+    return value
+
+
+_ELICIT_MAX_QUESTIONS = 6
+
+
+def _form_field_name(field: Any) -> str:
+    name = re.sub(r"[^0-9A-Za-z_]+", "_", f"{field or ''}").strip("_")
+    if not name:
+        return ""
+    if name[0].isdigit():
+        name = f"q_{name}"
+    return name if name not in {"decision", "notes"} else f"q_{name}"
+
+
+def _gate_questions(gate_error: dict[str, Any] | None) -> list[dict[str, Any]]:
+    details = (gate_error or {}).get("details") or {}
+    items = details.get("ask_if_missing") or (details.get("agent_recovery") or {}).get("ask_if_missing") or []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _gate_elicitation_schema(gate_error: dict[str, Any] | None = None) -> type[BaseModel]:
+    """闸门表单（v0.36.0 B3）：三选一 + 每个带 options 的闸问题一个枚举字段（≤6）+ 备注。
+
+    字段只从策略声明的 options 生成，答案也只允许写回策略声明过的 values——表单不是新的自由输入口。
+    """
+    fields: dict[str, Any] = {
+        "decision": (
+            Literal[_ELICIT_DEFAULTS, _ELICIT_PROVIDE, _ELICIT_CANCEL],  # type: ignore[valid-type]
+            _ELICIT_DEFAULTS,
+        ),
+    }
+    for item in _gate_questions(gate_error):
+        options = [str(option) for option in (item.get("options") or []) if str(option).strip()]
+        name = _form_field_name(item.get("field"))
+        if not options or not name or name in fields:
+            continue
+        if len(fields) - 1 >= _ELICIT_MAX_QUESTIONS:
+            break
+        fields[name] = (
+            str,
+            Field(default="", description=str(item.get("question") or item.get("field") or ""), json_schema_extra={"enum": [*options, ""]}),
+        )
+    fields["notes"] = (str, "")
+    return create_model("HorosaGateDecision", **fields)
+
+
+def _note_elicitation(gate_error: dict[str, Any], status: str, **extra: Any) -> None:
+    """把 elicitation 的去向写进 details.elicitation：agent 看得到「问过没有、为什么没问成」。"""
+    details = gate_error.setdefault("details", {})
+    if isinstance(details, dict):
+        details["elicitation"] = {"status": status, **extra}
+
+
+def _apply_gate_answers(
+    gate_error: dict[str, Any], answers: dict[str, Any] | None
+) -> tuple[dict[str, Any], list[str]]:
+    """表单逐题答案 → (可写回载荷的字段值, 人话记录)。只认策略声明过的 option；有 values 才写值。"""
+    applied: dict[str, Any] = {}
+    noted: list[str] = []
+    if not answers:
+        return applied, noted
+    by_name = {_form_field_name(item.get("field")): item for item in _gate_questions(gate_error)}
+    for key, answer in answers.items():
+        text = f"{answer or ''}".strip()
+        item = by_name.get(str(key))
+        if not text or item is None:
+            continue
+        options = [str(option) for option in (item.get("options") or [])]
+        if text not in options:
+            continue
+        field = str(item.get("field") or "")
+        noted.append(f"{field}={text}")
+        values = item.get("values")
+        if isinstance(values, list) and len(values) == len(options) and field and "/" not in field:
+            value = values[options.index(text)]
+            if value is not None:
+                applied[field] = value
+    return applied, noted
+
+
+def _apply_gate_decision(
+    payload: dict[str, Any], gate_error: dict[str, Any], decision: str, notes: str, answers: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """纯函数：把表单答案落到载荷（接受默认 / 逐题作答）或闸门错误（用户备注），不碰传输层，可离线测。"""
+    applied, noted = _apply_gate_answers(gate_error, answers)
+    if decision == _ELICIT_DEFAULTS:
+        updated = dict(payload)
+        updated.update(applied)
+        updated["defaults_accepted"] = True
+        note = "user accepted Xingque defaults via MCP elicitation form"
+        if noted:
+            note += "; answered: " + "; ".join(noted)
+        updated["clarification_notes"] = f"{note}; user notes: {notes}" if notes else note
+        return updated
+    if decision == _ELICIT_PROVIDE and noted:
+        # 用户在表单里逐题选了具体设置：这就是确认，写回声明过的值后带 agent_confirmed_settings 重试
+        updated = dict(payload)
+        updated.update(applied)
+        updated["agent_confirmed_settings"] = True
+        note = "user answered the clarification form via MCP elicitation: " + "; ".join(noted)
+        updated["clarification_notes"] = f"{note}; user notes: {notes}" if notes else note
+        return updated
+    if notes:
+        # 用户选了「补充设置」并给了备注：不代答具体参数，把原话带回给 agent 追问闭环。
+        gate_error.setdefault("details", {})["user_notes"] = notes
+        recovery = gate_error.get("details", {}).get("agent_recovery")
+        if isinstance(recovery, dict):
+            recovery["user_notes"] = notes
+    return None
+
+
+async def _maybe_elicit_gate(
+    mcp: FastMCP, tool_name: str, payload: dict[str, Any], gate_error: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Try resolving a tripped clarification gate via native MCP elicitation.
+
+    Returns an updated payload to proceed with, or None to fall back to the structured
+    gate error (which may be enriched with the user's form answer in details.user_notes).
+    Every exit leaves ``details.elicitation.status`` behind (disabled / unsupported / declined /
+    cancelled / answered / defaults / failed): a swallowed exception used to look exactly like
+    "the client never supported elicitation" (v0.36.0 A2).
+    """
+    if not _elicitation_enabled():
+        _note_elicitation(gate_error, "disabled")
+        return None
+    try:
+        ctx = mcp.get_context()
+        session = ctx.session
+        if not session.check_client_capability(
+            mcp_types.ClientCapabilities(elicitation=mcp_types.ElicitationCapability())
+        ):
+            _note_elicitation(gate_error, "unsupported")
+            return None
+        prompt = (
+            gate_error.get("details", {}).get("agent_recovery", {}).get("prompt_to_user")
+            or f"调用 {tool_name} 前需要确认会影响结果的设置。"
+        )
+        budget = _elicit_timeout_seconds()
+        result = None
+        if budget > 0:
+            with anyio.move_on_after(budget):
+                result = await ctx.elicit(message=prompt, schema=_gate_elicitation_schema(gate_error))
+            if result is None:
+                # 超时 = 没人在那头。把结构化闸门原样交回，agent 照常「先问后调」。
+                _note_elicitation(gate_error, "timeout", timeout_seconds=f"{budget:g}")
+                return None
+        else:
+            result = await ctx.elicit(message=prompt, schema=_gate_elicitation_schema(gate_error))
+        if result.action != "accept" or result.data is None:
+            _note_elicitation(gate_error, "declined", action=f"{result.action}")
+            return None
+        decision = f"{getattr(result.data, 'decision', '') or ''}"
+        notes = str(getattr(result.data, "notes", "") or "").strip()
+        data_fields = getattr(result.data, "model_dump", None)
+        raw_answers = data_fields() if callable(data_fields) else dict(getattr(result.data, "__dict__", {}) or {})
+        answers = {k: v for k, v in raw_answers.items() if k not in {"decision", "notes"}}
+        updated = _apply_gate_decision(payload, gate_error, decision, notes, answers=answers)
+        if updated is not None:
+            status = "defaults" if decision == _ELICIT_DEFAULTS else "answered_form"
+        else:
+            status = "cancelled" if decision == _ELICIT_CANCEL else "answered"
+        _note_elicitation(gate_error, status, decision=decision)
+        return updated
+    except Exception as exc:  # noqa: BLE001 — elicitation must never become a new failure mode
+        # 记进 details 就是给调用方的交代；日志用 info（包内 logger.warning 只留给未上抛的真降级）。
+        logger.info("MCP elicitation for %s failed: %s", tool_name, exc)
+        _note_elicitation(gate_error, "failed", error=f"{type(exc).__name__}: {exc}")
+        return None
+
+
+def build_transport_security(host: str, port: int) -> Any:
+    """DNS-rebinding 防护的允许 Host 列表。
+
+    🔴 SDK 的缺省只在 host 是回环时开启，且允许列表**只有**回环三种写法。两个后果：
+      · Docker Desktop 里的客户端（Open WebUI / n8n / Dify）发的是 `Host: host.docker.internal:8765`
+        → 一律 421，症状是「服务明明在跑，容器里就是连不上」；
+      · 绑到 `0.0.0.0` 时 SDK **完全不开**防护 —— 恰恰是最需要它的那种绑法。
+    这里两边都补上：把实际绑定的 host、回环、以及 Docker 的宿主别名都放行，并允许用
+    HOROSA_MCP_ALLOWED_HOSTS 追加（逗号分隔）。
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    extra = [
+        item.strip()
+        for item in (os.environ.get("HOROSA_MCP_ALLOWED_HOSTS", "") or "").split(",")
+        if item.strip()
+    ]
+    hosts = [
+        f"{host}:*", "127.0.0.1:*", "localhost:*", "[::1]:*", "host.docker.internal:*", *extra
+    ]
+    origins = [f"http://{item}" for item in hosts] + [f"https://{item}" for item in hosts]
+    # 去重但保序（列表进日志/报错时可读）
+    seen: set[str] = set()
+    hosts = [h for h in hosts if not (h in seen or seen.add(h))]
+    seen = set()
+    origins = [o for o in origins if not (o in seen or seen.add(o))]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins
+    )
+
+
+class StaticTokenVerifier:
+    """单个共享 Bearer token 的校验器（`--token` / HOROSA_MCP_TOKEN）。
+
+    不是 OAuth，也不假装是：非回环绑定时至少要有**一道**门，而共享 token 是唯一能让
+    Open WebUI / n8n / Dify 这类只会填一个 Authorization 头的客户端用起来的形式。
+    比较走 `hmac.compare_digest`，不给计时侧信道。
+    """
+
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    async def verify_token(self, token: str) -> Any:
+        import hmac
+
+        from mcp.server.auth.provider import AccessToken
+
+        if not token or not hmac.compare_digest(token, self._token):
+            return None
+        return AccessToken(token=token, client_id="horosa-skill", scopes=[], expires_at=None)
+
+
+def build_auth_settings(host: str, port: int, token: str | None) -> Any:
+    """有 token 时构造 AuthSettings（SDK 据此给 401 + WWW-Authenticate）。"""
+    if not token:
+        return None
+    from mcp.server.auth.settings import AuthSettings
+
+    base = f"http://{'127.0.0.1' if host in {'0.0.0.0', '::'} else host}:{port}"
+    return AuthSettings(issuer_url=base, resource_server_url=None)
+
+
+def create_mcp_server(service: HorosaSkillService, settings: Settings) -> FastMCP:
+    token = (os.environ.get("HOROSA_MCP_TOKEN", "") or "").strip() or None
+    mcp = FastMCP(
+        "Horosa Skill",
+        instructions=_server_instructions(decision_layer_on=getattr(service, "decision_layer", None) is not None),
+        website_url="https://github.com/Horace-Maxwell/horosa-skill",
+        icons=[_SERVER_ICON],
+        host=settings.host,
+        port=settings.port,
+        streamable_http_path="/mcp",
+        mount_path="/",
+        log_level=settings.log_level,
+        transport_security=build_transport_security(settings.host, settings.port),
+        auth=build_auth_settings(settings.host, settings.port, token),
+        token_verifier=StaticTokenVerifier(token) if token else None,
+    )
+    # 🔴 FastMCP 不把 version 透给 lowlevel Server，于是 initialize 的 serverInfo.version 回落成
+    # **MCP SDK 自己的版本**（实测 "1.29.0"）。每个客户端的 server 列表因此显示
+    # 「Horosa Skill 1.29.0」—— 看起来就像我们的版本号，而用户报 bug 时会照抄它。
+    mcp._mcp_server.version = __version__
+
+    async def horosa_dispatch(**kwargs: Any) -> DispatchEnvelope:
+        raw_payload = _merge_mcp_arguments(kwargs)
+        if isinstance(raw_payload, dict):
+            error = _agent_preflight_error("dispatch", raw_payload)
+            if error is not None:
+                updated = await _maybe_elicit_gate(mcp, "dispatch", raw_payload, error)
+                if updated is None:
+                    return _gate_to_dispatch_envelope(error)
+                raw_payload = updated
+        try:
+            return await _run_tool_blocking(
+                mcp, service.dispatch, _normalize_mcp_request(raw_payload, DispatchInput)
+            )
+        except ToolValidationError as exc:
+            return _gate_to_dispatch_envelope(_mcp_error_payload(exc))
+        except ValidationError as exc:
+            return _gate_to_dispatch_envelope(
+                _mcp_error_payload(_validation_error("horosa_dispatch", "dispatch", exc))
+            )
+        except Exception as exc:  # noqa: BLE001 - 兜底也必须是 envelope，不能变 isError 裸文本
+            return _gate_to_dispatch_envelope(_mcp_internal_error_payload(exc))
+    dispatch_doc = (
+        "Route a natural-language 术数/占星 request to the right Horosa technique tools and run them. "
+        "Results are saved to local memory by default (save_result=false to disable)."
+    )
+    if settings.mcp_compact:
+        # 目录只在 horosa_tool_run 的描述里放一份（精简面预算 ≤30 KB）；这里只指路。
+        dispatch_doc += (
+            f"\n\nCompact surface: {len(TOOL_DEFINITIONS)} techniques are reachable by name via horosa_tool_run "
+            "(resource horosa://catalog/techniques lists them all; horosa_agent_guidance(include_all=true) "
+            "returns the same index inline, and a wrong tool name comes back with the catalog attached)."
+        )
+    horosa_dispatch.__doc__ = dispatch_doc
+    horosa_dispatch.__signature__ = _signature_for_input_model(
+        DispatchInput, return_type=_return_type(DispatchEnvelope)
+    )
+    mcp.tool(
+        name="horosa_dispatch",
+        title="自然语言调度 / dispatch",
+        annotations=_ANN_CALC,
+        meta=_tool_meta("horosa_dispatch"),
+    )(horosa_dispatch)
+
+    async def horosa_agent_guidance(**kwargs: Any) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            payload = _normalize_mcp_request(_merge_mcp_arguments(kwargs), AgentGuidanceInput)
+            guidance = build_agent_guidance(
+                tool_name=payload.get("tool_name"),
+                intent=payload.get("intent"),
+                include_all=payload.get("include_all", False),
+            )
+            if isinstance(guidance, dict):
+                guidance["server_profile"] = _server_profile(settings)
+            return guidance
+
+        return await _guarded_facade(mcp, "horosa_agent_guidance", _run)
+    horosa_agent_guidance.__doc__ = (
+        "Return machine-readable guidance for agents before calling Horosa tools. "
+        "Use this to decide which user settings must be clarified instead of silently defaulted."
+    )
+    horosa_agent_guidance.__signature__ = _signature_for_input_model(AgentGuidanceInput)
+    horosa_agent_guidance.__annotations__ = {"return": dict[str, Any]}
+    mcp.tool(
+        name="horosa_agent_guidance",
+        title="调用前参数指引 / clarification guidance",
+        annotations=_ANN_QUERY,
+        meta=_tool_meta("horosa_agent_guidance"),
+    )(horosa_agent_guidance)
+
+    async def horosa_memory_record_answer(**kwargs: Any) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return service.record_ai_answer(
+                _normalize_mcp_request(_merge_mcp_arguments(kwargs), MemoryAnswerInput)
+            )
+
+        return await _guarded_facade(mcp, "horosa_memory_record_answer", _run)
+    horosa_memory_record_answer.__doc__ = (
+        "Attach your final AI answer to a stored run (by run_id) without rendering a report. "
+        "Use this only when you are NOT calling horosa_report_render — that one already writes "
+        "the ai_report back to memory itself."
+    )
+    horosa_memory_record_answer.__signature__ = _signature_for_input_model(MemoryAnswerInput)
+    horosa_memory_record_answer.__annotations__ = {"return": dict[str, Any]}
+    mcp.tool(
+        name="horosa_memory_record_answer",
+        title="回写 AI 结论 / record answer",
+        annotations=_ANN_RENDER,
+    )(horosa_memory_record_answer)
+
+    async def horosa_memory_query(**kwargs: Any) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return service.query_memory(
+                _normalize_mcp_request(_merge_mcp_arguments(kwargs), MemoryQueryInput)
+            )
+
+        return await _guarded_facade(mcp, "horosa_memory_query", _run)
+    horosa_memory_query.__doc__ = (
+        "Search past Horosa runs stored locally (every tool call is recorded). Filters combine with AND:\n"
+        "  text — full-text over question / answer / snapshot (SQLite FTS5 trigram: Chinese substrings "
+        "match, no word segmentation needed)\n"
+        "  entity — the subject a run is about, i.e. a person's name (e.g. \"张三\")\n"
+        "  tool — technique tool name (e.g. \"qimen\", \"bazi_birth\")\n"
+        "  artifact_kind — stored artifact type: report_json / report_docx / report_pdf / snapshot\n"
+        "  after / before — ISO dates bounding when the run happened; limit + offset paginate\n"
+        "Examples: {\"entity\": \"张三\", \"tool\": \"bazi_birth\", \"limit\": 5} · "
+        "{\"text\": \"事业\", \"after\": \"2026-01-01\"}\n"
+        "Returns run summaries with run_id — pass that to horosa_memory_show or horosa_report_render."
+    )
+    horosa_memory_query.__signature__ = _signature_for_input_model(MemoryQueryInput)
+    horosa_memory_query.__annotations__ = {"return": dict[str, Any]}
+    mcp.tool(
+        name="horosa_memory_query",
+        title="检索历史记录 / search runs",
+        annotations=_ANN_QUERY,
+    )(horosa_memory_query)
+
+    async def horosa_memory_show(**kwargs: Any) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return service.show_memory(
+                _normalize_mcp_request(_merge_mcp_arguments(kwargs), MemoryShowInput)
+            )
+
+        return await _guarded_facade(mcp, "horosa_memory_show", _run)
+    horosa_memory_show.__doc__ = (
+        "Fetch one stored run in full by run_id: the normalized input, the export snapshot, any AI "
+        "answer written back, and the paths of generated artifacts (JSON/DOCX/PDF). Use it to resume "
+        "a past reading without re-casting the chart."
+    )
+    horosa_memory_show.__signature__ = _signature_for_input_model(MemoryShowInput)
+    horosa_memory_show.__annotations__ = {"return": dict[str, Any]}
+    mcp.tool(
+        name="horosa_memory_show",
+        title="查看单次记录 / show run",
+        annotations=_ANN_QUERY,
+    )(horosa_memory_show)
+
+    async def horosa_report_template(**kwargs: Any) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return service.report_template(
+                _normalize_mcp_request(_merge_mcp_arguments(kwargs), ReportTemplateInput)
+            )
+
+        return await _guarded_facade(mcp, "horosa_report_template", _run)
+    horosa_report_template.__doc__ = (
+        "Return the empty ai_report skeleton for a stored run (run_id + tool_name): which analysis "
+        "fields to fill (direct_answer / executive_summary / analysis_sections / evidence / "
+        "recommendations / limitations) and which export sections are available as evidence. "
+        "Fill it from the run's export snapshot, then pass it to horosa_report_render."
+    )
+    horosa_report_template.__signature__ = _signature_for_input_model(ReportTemplateInput)
+    horosa_report_template.__annotations__ = {"return": dict[str, Any]}
+    mcp.tool(
+        name="horosa_report_template",
+        title="报告骨架 / report template",
+        annotations=_ANN_QUERY,
+    )(horosa_report_template)
+
+    async def horosa_report_render(**kwargs: Any) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return service.report_render(
+                _normalize_mcp_request(_merge_mcp_arguments(kwargs), ReportRenderInput)
+            )
+
+        return await _guarded_facade(mcp, "horosa_report_render", _run)
+    horosa_report_render.__doc__ = (
+        "Render a stored run into a DOCX/PDF/JSON report. Preferred when you already have a run_id "
+        "(from a prior tool call): pass run_id + format + your ai_report; the ai_report is auto "
+        "written back to memory (no separate memory_record_answer call needed)."
+    )
+    horosa_report_render.__signature__ = _signature_for_input_model(ReportRenderInput)
+    horosa_report_render.__annotations__ = {"return": dict[str, Any]}
+    mcp.tool(
+        name="horosa_report_render",
+        title="渲染报告 / render report",
+        annotations=_ANN_REPORT_WRITE,
+    )(horosa_report_render)
+
+    async def horosa_hecan(**kwargs: Any) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return service.hecan(_normalize_mcp_request(_merge_mcp_arguments(kwargs), HecanInput))
+
+        return await _guarded_facade(mcp, "horosa_hecan", _run)
+    horosa_hecan.__doc__ = (
+        "合参 / cross-technique synthesis: run SEVERAL techniques on one question (router-selected or "
+        "explicit `tools`, capped by max_tools) under one group, then return a synthesis TEMPLATE — "
+        "per-technique evidence tables, cross-technique setting-consistency verdicts, and ai_fillable "
+        "slots (per-technique conclusion / convergence / divergence / final answer). Fill it from the "
+        "real exported sections; divergence must be disclosed, never averaged. This returns a template, "
+        "not a finished reading."
+    )
+    horosa_hecan.__signature__ = _signature_for_input_model(HecanInput)
+    horosa_hecan.__annotations__ = {"return": dict[str, Any]}
+    mcp.tool(
+        name="horosa_hecan",
+        title="合参 / cross-technique synthesis",
+        annotations=_ANN_CALC,
+    )(horosa_hecan)
+
+    async def horosa_technique_report(**kwargs: Any) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return service.technique_report(
+                _normalize_mcp_request(_merge_mcp_arguments(kwargs), TechniqueReportInput)
+            )
+
+        return await _guarded_facade(mcp, "horosa_technique_report", _run)
+    horosa_technique_report.__doc__ = (
+        "Render the DETERMINISTIC method/provenance report for stored runs: which techniques ran, "
+        "which result-sensitive settings were in force (晚子时 switches, 贵人法, ayanamsa, …), which "
+        "engine actually computed each one, section coverage, and the version chain. Pass run_id for "
+        "one call or group_id to cover a whole session (it then also flags cross-technique setting "
+        "conflicts). format = markdown | json | docx | pdf.\n\n"
+        "This is NOT the consulting report: it needs no ai_report and never contains an interpretation. "
+        "Use horosa_report_render for the AI-authored reading."
+    )
+    horosa_technique_report.__signature__ = _signature_for_input_model(TechniqueReportInput)
+    horosa_technique_report.__annotations__ = {"return": dict[str, Any]}
+    mcp.tool(
+        name="horosa_technique_report",
+        title="技法依据报告 / technique provenance report",
+        # 🔴 readOnlyHint=False：`format = docx | pdf` 时它**往磁盘写文件**。标 readOnly 的后果不是
+        # 目录审核不过，而是自动放行只读工具的客户端（Claude Code 白名单、Cline auto-approve、
+        # VS Code）会在不问用户的情况下落盘。idempotent 仍为真（同参数同产物），openWorld 恒 False。
+        annotations=_ANN_REPORT_WRITE,
+    )(horosa_technique_report)
+
+    # horosa_report_from_run 已下线：与 horosa_report_render 逐行同义（同一 ReportRenderInput
+    # → service.report_render），两个同义工具挤占 tools/list 并造成「该用哪个」歧义。
+
+    async def horosa_report_from_tool(**kwargs: Any) -> dict[str, Any]:
+        raw_payload = _merge_mcp_arguments(kwargs)
+        if isinstance(raw_payload, dict):
+            tool_name = raw_payload.get("tool_name")
+            payload = raw_payload.get("payload")
+            if isinstance(tool_name, str) and isinstance(payload, dict):
+                error = _agent_preflight_error(tool_name, payload)
+                if error is not None:
+                    updated = await _maybe_elicit_gate(mcp, tool_name, payload, error)
+                    if updated is None:
+                        return error
+                    raw_payload = dict(raw_payload)
+                    raw_payload["payload"] = updated
+        payload_for_run = raw_payload
+
+        def _run() -> dict[str, Any]:
+            return service.report_from_tool(
+                _normalize_mcp_request(payload_for_run, ReportFromToolInput)
+            )
+
+        return await _guarded_facade(mcp, "horosa_report_from_tool", _run)
+    horosa_report_from_tool.__doc__ = (
+        "One-shot: run a technique tool AND prepare its report. NOTE this re-casts the chart — if you "
+        "already called the tool and hold a run_id, use horosa_report_render instead (avoids a duplicate "
+        "backend call and a duplicate stored run)."
+    )
+    horosa_report_from_tool.__signature__ = _signature_for_input_model(ReportFromToolInput)
+    horosa_report_from_tool.__annotations__ = {"return": dict[str, Any]}
+    mcp.tool(
+        name="horosa_report_from_tool",
+        title="起盘并出报告 / cast + report",
+        annotations=_ANN_REPORT_FROM_TOOL,
+    )(horosa_report_from_tool)
+
+    # ------------------------------------------------------------------
+    # MCP resources：只读目录以资源形态暴露（客户端可 @ 引用，不占 tools/list）。
+    # ------------------------------------------------------------------
+
+    @mcp.resource(
+        "horosa://catalog/techniques",
+        name="horosa-technique-catalog",
+        title="Horosa 技法目录 / technique catalog",
+        description="All callable Horosa technique tools with one-line bilingual descriptions.",
+        mime_type="text/markdown",
+    )
+    def technique_catalog_resource() -> str:
+        return build_technique_catalog()
+
+    @mcp.resource(
+        "horosa://catalog/export-registry",
+        name="horosa-export-registry",
+        title="Horosa 导出契约注册表 / export contract registry",
+        description="Machine-readable export contract (per-technique snapshot sections) mirrored from Xingque aiExport.",
+        mime_type="application/json",
+    )
+    def export_registry_resource() -> str:
+        return json.dumps(build_export_registry(), ensure_ascii=False, indent=2)
+
+    @mcp.resource(
+        "horosa://runtime/status",
+        name="horosa-runtime-status",
+        title="Horosa 本机 runtime 状态 / local runtime status",
+        description=(
+            "Where THIS server process looks for the offline runtime and local data (installed / runtime_root / "
+            "data_dir / mode / version). Read-only, never starts the runtime; `setup` compares it with the host."
+        ),
+        mime_type="application/json",
+    )
+    def runtime_status_resource() -> str:
+        # 🔴 只读文件系统，绝不 start_local_services：这是 setup 的 stdio 探针在「客户端形状的环境」里读的第一样东西，
+        # 用来抓「server 算出的 runtime 根 ≠ 终端里装的」（Codex 不转发 shell 环境 / GUI 客户端不读 shell 配置）。
+        from horosa_skill import __version__ as _pkg_version
+        from horosa_skill.runtime.manager import HorosaRuntimeManager as _Manager
+
+        manager = _Manager(settings)
+        return json.dumps(
+            {
+                "installed": settings.runtime_current_dir.exists(),
+                "runtime_root": str(settings.runtime_root),
+                "data_dir": str(settings.data_dir),
+                "mode": manager.runtime_mode(),
+                "package_version": _pkg_version,
+                "server_root": settings.server_root,
+                "chart_server_root": settings.chart_server_root,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    # ------------------------------------------------------------------
+    # MCP prompts：高频工作流按钮化（Claude Code 里成为 /mcp__horosa__… 斜杠命令）。
+    # ------------------------------------------------------------------
+
+    @mcp.prompt(
+        name="quick_cast",
+        title="快速起盘并解读 / quick cast & read",
+        description="Cast one Horosa technique for a moment/birth and explain from the export snapshot.",
+    )
+    def prompt_quick_cast(technique: str = "", question: str = "") -> str:
+        target = technique or "（按用户意图选择技法）"
+        asked = question or "（用户尚未给出具体问题）"
+        return (
+            f"请用 Horosa 工具起一个「{target}」盘并解读。用户的问题：{asked}。\n"
+            "流程：1) 若时间/地点/性别/流派等会改变结果的设置缺失，先按 horosa_agent_guidance 问我；"
+            "2) 调用对应技法工具（用户确认后带 agent_confirmed_settings/defaults_accepted）；"
+            "3) 只根据返回的 export_snapshot.export_text 分段解读——先结论、再证据段、再机会/风险/时机/建议；"
+            "4) 不要手算任何术数结果。"
+        )
+
+    @mcp.prompt(
+        name="annual_fortune",
+        title="流年运势报告 / annual fortune report",
+        description="Run the right predictive tools for a target year and produce a structured reading.",
+    )
+    def prompt_annual_fortune(year: str = "", birth: str = "") -> str:
+        return (
+            f"请为我做{year or '目标年份'}的流年运势分析（出生信息：{birth or '待我提供'}）。\n"
+            "要求：1) 先确认目标年份、出生数据、地点时区等必需设置（缺了就问我）；"
+            "2) 选择合适的推运工具（如 profection/solarreturn/bazi_direct/liureng_runyear），"
+            "预测类必须带目标 datetime/dirZone 等字段；3) 每个结论都引用返回快照里的具体段落；"
+            "4) 最后按 机会/风险/时机/建议 汇总。"
+        )
+
+    @mcp.prompt(
+        name="export_report",
+        title="导出正式报告 / export a formal report",
+        description="Render the latest run into a DOCX/PDF consulting report with the AI analysis written back.",
+    )
+    def prompt_export_report(format: str = "docx") -> str:
+        return (
+            f"请把刚才的分析导出为 {format or 'docx'} 报告。\n"
+            "流程：用已有 run_id 调 horosa_report_render（format + ai_report，分析会自动写回记忆；"
+            "不要用 horosa_report_from_tool 重复起盘）。报告正文要像咨询报告：直接结论开头、"
+            "引用盘面证据、机会/风险/时机/建议分列、保留「排盘规则」行；不要出现 run_id/JSON 等机器元数据。"
+        )
+
+    toolsets = _selected_toolsets()
+    if settings.mcp_compact or toolsets is not None:
+        # 精简模式（10 门面 + tool_run = COMPACT_SURFACE_TOOL_COUNT=11 工具）或 HOROSA_TOOLSETS 裁剪面：只要技法面被过滤就注册直呼通道。：技法工具不平铺，注册一个按名直呼的通用工具（dispatch 关键词路由只覆盖部分技法，
+        # 直呼通道保证全部技法（len(TOOL_DEFINITIONS)）可达）；澄清闸照常生效。
+        async def horosa_tool_run(**kwargs: Any) -> ToolEnvelope:
+            # tool_name 必须在合并之前取走：它是 `request` 的**兄弟**参数，而 `_merge_mcp_arguments`
+            # 在 request 存在时会整体改用 request 作为载荷（否则 `{tool_name, request}` 这种最常见的
+            # 调法会把 tool_name 丢掉）。未显式给出的公共字段是 None，一并剔除，避免 None 被当作
+            # 「用户已提供该设置」而影响澄清闸的追问过滤。
+            tool_name = str(kwargs.pop("tool_name", "") or "")
+            request = kwargs.get("request")
+            kwargs = {key: value for key, value in kwargs.items() if value is not None}
+            raw_payload = _merge_mcp_arguments(kwargs)
+            if not isinstance(raw_payload, dict):
+                raw_payload = {}
+            raw_payload.pop("tool_name", None)
+            payload = request if isinstance(request, dict) else raw_payload
+            if tool_name not in TOOL_DEFINITIONS:
+                return _mcp_error_envelope(
+                    ToolValidationError(
+                        f"Unknown tool: {tool_name or '(missing tool_name)'}",
+                        code="tool.unknown",
+                        details={
+                            "tool_name": tool_name,
+                            "catalog": technique_index(),
+                            "hint": "details.catalog 按域列出全部合法技法名；全文见资源 horosa://catalog/techniques。",
+                        },
+                    ),
+                    tool_name=tool_name or "horosa_tool_run",
+                )
+            error = _agent_preflight_error(tool_name, payload)
+            if error is not None:
+                updated = await _maybe_elicit_gate(mcp, tool_name, payload, error)
+                if updated is None:
+                    return _gate_to_envelope(error, tool_name=tool_name)
+                payload = updated
+            try:
+                return await _run_tool_blocking(
+                    mcp,
+                    service.run_tool,
+                    tool_name,
+                    _normalize_mcp_request(payload, TOOL_DEFINITIONS[tool_name].input_model),
+                )
+            except ToolValidationError as exc:
+                return _mcp_error_envelope(exc, tool_name=tool_name)
+            except ValidationError as exc:
+                return _mcp_error_envelope(
+                    _validation_error("horosa_tool_run", tool_name, exc), tool_name=tool_name
+                )
+
+        horosa_tool_run.__doc__ = (
+            "Run any Horosa technique tool by name. Pass `tool_name` plus the tool's input fields: "
+            "the common birth/event fields are declared below, and **any other technique-specific "
+            "field must go inside `request`** (e.g. request={\"guirengType\":2}) — undeclared "
+            "top-level keys are dropped by the MCP argument layer. Same clarification gate and "
+            "envelope as the dedicated tools.\n"
+            # 🔴 技法目录不再内嵌：它有 4145 字符，而 OpenAI 的 function 描述上限是 1024 ——
+            # 超限的后果是被拒或截断，而本工具是精简面下抵达全部技法的**唯一**通道。
+            # 三条发现路径取代它：① 点错名字时 tool.unknown 的 details.catalog 直接给全部合法名字
+            # （自愈式报错）；② 资源 horosa://catalog/techniques 有全文；③ horosa_agent_guidance。
+            "Discover technique names via the horosa://catalog/techniques resource, "
+            "horosa_agent_guidance, or simply call with a wrong tool_name — the error lists them all."
+        )
+        # 必须手写 signature：函数是 `**kwargs` 多态入口，没有单一 input model 可推导。
+        # 缺了它 FastMCP 会内省出一个名叫 `kwargs` 的 string 必填参数，整个工具无法调用——
+        # 而它是 compact 模式下抵达全部技法的唯一通道（技法工具在该模式下根本不注册）。
+        horosa_tool_run.__signature__ = _tool_run_signature(return_type=_return_type(ToolEnvelope))
+        mcp.tool(
+            name="horosa_tool_run",
+            title="按名直调技法 / run any technique",
+            annotations=_ANN_CALC,
+            meta=_tool_meta("horosa_tool_run"),
+        )(horosa_tool_run)
+    if settings.mcp_compact:
+        apply_advertised_schemas(mcp)
+        return mcp
+
+    for definition in TOOL_DEFINITIONS.values():
+        if toolsets is not None and definition.domain.lower() not in toolsets:
+            continue
+        input_model = definition.input_model
+
+        def _factory(tool_name: str, model: Any) -> Any:
+            async def _tool(**kwargs: Any) -> ToolEnvelope:
+                raw_payload = _merge_mcp_arguments(kwargs)
+                if isinstance(raw_payload, dict):
+                    error = _agent_preflight_error(tool_name, raw_payload)
+                    if error is not None:
+                        updated = await _maybe_elicit_gate(mcp, tool_name, raw_payload, error)
+                        if updated is None:
+                            return _gate_to_envelope(error, tool_name=tool_name)
+                        raw_payload = updated
+                try:
+                    return await _run_tool_blocking(
+                        mcp,
+                        service.run_tool,
+                        tool_name,
+                        _normalize_mcp_request(raw_payload, model),
+                    )
+                except ToolValidationError as exc:
+                    return _mcp_error_envelope(exc, tool_name=tool_name)
+                except ValidationError as exc:
+                    return _mcp_error_envelope(
+                        _validation_error(tool_name, tool_name, exc), tool_name=tool_name
+                    )
+
+            _tool.__name__ = TOOL_DEFINITIONS[tool_name].mcp_name
+            _tool.__doc__ = build_tool_docstring(tool_name)
+            _tool.__signature__ = _signature_for_input_model(
+                model, return_type=_return_type(ToolEnvelope)
+            )
+            mcp_name = TOOL_DEFINITIONS[tool_name].mcp_name
+            return mcp.tool(
+                name=mcp_name,
+                title=_tool_title(tool_name),
+                annotations=_tool_annotations(tool_name),
+                meta=_tool_meta(mcp_name),
+            )(_tool)
+
+        _factory(definition.name, input_model)
+
+    # 广告层瘦身（B1）：注册后重写 Tool.parameters/description；签名（校验层）不动，隐藏旋钮顶层照收。
+    apply_advertised_schemas(mcp)
+    return mcp
+
+
+def run_mcp_server(settings: Settings, *, transport: str, service: HorosaSkillService | None = None) -> None:
+    service = service or HorosaSkillService(settings)
+    server = create_mcp_server(service, settings)
+    server.run(transport=transport)
+
+
+def main() -> None:
+    """MCPB 的 `server.entry_point` 入口：以 stdio 传输起 server。
+
+    MCPB 宿主（Claude Desktop）实际执行的是 manifest 里的 `mcp_config.command/args`，
+    但 `entry_point` 必须指向一个**可直接运行**的文件 —— 打包校验会看它存在，而用户排障时
+    `python -m horosa_skill.surfaces.mcp_server` 应该也真的能起来，不能是一个 import 完就退出的模块。
+    """
+    from horosa_skill.surfaces.cli import app
+
+    app(["serve", "--transport", "stdio"])
+
+
+if __name__ == "__main__":
+    main()
