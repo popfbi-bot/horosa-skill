@@ -83,12 +83,21 @@ jobs:
           fi
 
           git remote add cnb "$CNB_URL"
-          git fetch cnb main
+          git fetch --no-tags cnb "+refs/heads/main:refs/remotes/cnb/main"
 
           # 只允许快进：CNB 侧必须是 GitHub 的后代，否则说明分叉了
           if ! git merge-base --is-ancestor HEAD cnb/main; then
             echo "::error::检测到分叉 —— CNB 侧不是 GitHub 的后代，拒绝自动合并"
-            echo "请人工在 GitHub 侧 rebase 或reset 后再试"
+            BASE=$(git merge-base HEAD cnb/main 2>/dev/null || echo unknown)
+            echo ""
+            echo "| 项 | SHA |"
+            echo "|---|---|"
+            echo "| GitHub HEAD | \`$(git rev-parse HEAD)\` |"
+            echo "| CNB HEAD | \`$(git rev-parse cnb/main)\` |"
+            echo "| 共同祖先 | \`$BASE\` |"
+            echo ""
+            echo "常见成因：在 GitHub 侧直接提交了代码（未先同步到 CNB）。"
+            echo "处置：把 CNB 侧改动 pull 下来合并，而非直接 reset。"
             exit 1
           fi
 
