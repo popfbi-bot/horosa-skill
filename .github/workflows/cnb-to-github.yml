@@ -1,14 +1,17 @@
 name: cnb-to-github
 
-# 触发时机：
-#   1. CNB 侧 push 后，由 CNB webhook 触发（见 CNB 仓库的 .cnb.yml）
-#   2. 每 30 分钟兜底轮询一次，防止 webhook 漏事件
+# 作用：把 CNB 侧 Horosa-Web-App 等仓库的改动自动推回 GitHub。
+#
+# 触发方式：定时轮询（每 10 分钟）+ 手动触发。
+# 为什么不用 push 触发：CNB 平台未提供 webhook API，
+# 无法在 CNB 收到 push 的瞬间通知 GitHub Actions。
 on:
-  repository_dispatch:
-    types: [cnb-sync]
-  workflow_dispatch:          # 手动触发
+  # CNB 平台没有 webhook API，无法在 push瞬间通知 GitHub，
+  # 因此采用定时轮询。每 10 分钟一次，最大延迟 10 分钟。
+  # cron 刻意避开整点（用第 7,17,27,37,47,57 分），错开 GitHub Actions 高峰。
   schedule:
-    - cron: '13,43 * * * *' # 每半小时的第 13/43 分钟（错开整点高峰）
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:          # 需要立即同步时手动触发
 
 permissions:
   contents: write
