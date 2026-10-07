@@ -1,26 +1,27 @@
-# 镜像同步状态
+# CNB → GitHub 同步状态
 
 | 项 | 值 |
 |---|---|
 | 仓库 | `cnbnasa/horosa-skill` |
-| 源 | github.com/popfbi-bot/horosa-skill |
-| 最后运行 | 2026-10-06 18:17:07 CST |
-| 耗时 | 2 秒 |
-| 结果 | ✅ 首次同步完成 |
-| 源默认分支 | `main` |
+| 方向 | CNB → GitHub（github.com/popfbi-bot/horosa-skill） |
+| 最后运行 | 2026-10-08 03:17:11 CST |
+| 耗时 | 3 秒 |
+| 结果 | ✅ 已同步（自动合并分叉） |
+| 推送的提交 | 合并分叉后推到 f2c07d8 |
 
-## 容器自检
+## 说明
 
-| 检查项 | 结果 |
-|---|---|
-| git | git version 2.47.3 |
-| CNB_TOKEN | 已注入(长度27) |
-| 访问 github.com | 7d32195a45576c54c7e8408789d9f209cf813e52	HEAD |
-| 当前 HEAD | `7d32195` |
-| 当前 commit | sync: 更新状态 |
-
-## 详情
+本仓库已**取消本机双推**。现在的同步链路是：
 
 ```
-bootstrap → main 7d32195，501 commits
+本机 ──push──> CNB                随时手动
+CNB──crontab(每日 03:17) ──push──> GitHub   失败自动重试
+```
+
+GitHub 侧一天只同步一次，本机不因 GitHub 网络不稳而卡住。
+
+## 本次运行
+
+```
+合并分叉后推到 f2c07d8
 ```
